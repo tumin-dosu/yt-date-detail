@@ -143,6 +143,8 @@ YouTubeの動画リストで相対的な日付表示（「3年前」など）の
   - ライセンスなどの表示の追加
 - v2.6:readmeの変更
   - 詳細の追加
+- v2.7:一部UI対応
+- v2.8:YouTubeの変更に対応
 
 ## 免責事項
 
@@ -158,4 +160,4 @@ YouTubeの動画リストで相対的な日付表示（「3年前」など）の
   This project is licensed under the LGPL v3 - see the [LICENSE](LICENSE) file for details.
 
   CONTACT : tumin_sfre@outlook.com<br><br>
-  ***Copyright © 2025 tumin-dosu. All rights reserved.***
+  ***Copyright © 2026 tumin-dosu. All rights reserved.***

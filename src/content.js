@@ -1,716 +1,423 @@
 /* content.js
-Copyright (C) 2025 tumin-dosu
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU Lesser General Public License as published by
-the Free Software Foundation; version 3 of the License.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
-
-/*
- * @file YouTube Absolute Date Display Extension
- * @version 2.6 (Security Enhanced)
- * @author tumin-dosu
- * @date 2025-07-07
- * @description YouTube動画の相対日付表示の横に投稿年月日を追加するChrome拡張機能
- * @contact : tumin_sfre@outlook.com
- * Copyright 2025 tumin-dosu. All rights reserved.
+ * @file YouTube Absolute Date Display Extension (Hover-Only API / Fixed Next to Relative Date)
+ * @description 相対日付の「直後」に絶対日付を固定表示する
+ *              ※ YouTube APIはホバー時のみ呼び出す
+ *              ※ anchor固定 / Promise重複排除 / fail reason対応
  */
 
 const CONFIG = {
-  SELECTORS: {
-    CONTAINERS: [
-      'ytd-rich-grid-renderer',
-      'ytd-watch-next-secondary-results-renderer',
-      'ytd-item-section-renderer'
-    ],
-    VIDEO_ELEMENTS: [
-      'ytd-rich-item-renderer',
-      'ytd-video-renderer',
-      'ytd-compact-video-renderer',
-      'ytd-grid-video-renderer',
-      'yt-lockup-view-model-wiz',
-      'yt-lockup-view-model-wiz--vertical',
-      'yt-lockup-view-model-wiz--compact',
-      'yt-lockup-metadata-view-model'
-    ],
-    VIDEO_TITLE: '#video-title, .yt-lockup-metadata-view-model-wiz__title',
-    VIDEO_LINK: 'a[href*="watch?v="]',
-    METADATA_LINE: '#metadata-line span, .yt-content-metadata-view-model-wiz__metadata-row span',
-    DATE_OVERLAY: '.absolute-date-overlay'
-  },
+  VIDEO_CARDS: [
+    'ytd-rich-item-renderer',
+    'ytd-video-renderer',
+    'ytd-compact-video-renderer',
+    'ytd-grid-video-renderer',
+    'yt-lockup-view-model',
+    'yt-lockup-view-model-wiz'
+  ].join(', '),
+
+  METADATA_SELECTOR: [
+    '.ytContentMetadataViewModelMetadataRow',
+    '.yt-content-metadata-view-model-wiz__metadata-row',
+    '#metadata-line',
+    '#metadata',
+    '[aria-label]'
+  ].join(', '),
+
+  RELATIVE_DATE_PATTERN: /(ago|前|時間|分|秒|日|週|週間|か月|ヶ月|月|年)/i,
+
   TIMING: {
-    HOVER_DELAY_MS: 1200,
-    DEBOUNCE_DELAY_MS: 300,
-    URL_CHANGE_DELAY_MS: 1000,
-    SCROLL_THROTTLE_MS: 100,
-    RETRY_DELAY_MS: 500
-  },
-  ANIMATION_STEPS: [400, 800, 1200],
-  RETRY_ATTEMPTS: 3,
-  VIDEO_ID_PATTERNS: [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
-    /^([a-zA-Z0-9_-]{11})$/
-  ]
+    STEP_INTERVAL_MS: 250,
+    API_DELAY_MS: 700,
+    NEGATIVE_CACHE_TTL_MS: 60 * 1000,
+    ERROR_BADGE_TTL_MS: 1500
+  }
 };
 
 class Utils {
-  static throttle(func, delay) {
-    let timeoutId; let lastExecTime = 0;
-    return function (...args) {
-      const currentTime = Date.now();
-      if (currentTime - lastExecTime > delay) {
-        func.apply(this, args);
-        lastExecTime = currentTime;
+  static extractVideoId(input) {
+    let targetUrl = '';
+    if (typeof input === 'string') {
+      targetUrl = input;
+    } else if (input instanceof Element) {
+      const link = input.querySelector(
+        'a[href*="/watch?v="], a[href*="/live/"], a[href*="/shorts/"], a[href*="youtu.be/"]'
+      );
+      if (link?.href) {
+        targetUrl = link.href;
       } else {
-        clearTimeout(timeoutId);
-        timeoutId = setTimeout(() => {
-          func.apply(this, args);
-          lastExecTime = Date.now();
-        }, delay - (currentTime - lastExecTime));
+        const dataId = input.querySelector('[data-video-id]');
+        if (dataId?.dataset?.videoId) return dataId.dataset.videoId;
       }
-    };
-  }
+    }
 
-  static extractVideoId(url) {
-    if (!url || typeof url !== 'string') return null;
-    return CONFIG.VIDEO_ID_PATTERNS.map(p => url.match(p)).find(m => m)?.[1] || null;
-  }
+    if (!targetUrl) return null;
 
-  static formatDate(dateString) {
-    if (!dateString) return null;
     try {
-      const d = new Date(dateString);
-      if (isNaN(d.getTime())) return null;
-      return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
-    } catch (error) {
-      console.error('[YTDate] Date formatting error:', error);
+      const url = new URL(targetUrl, window.location.origin);
+
+      if (url.searchParams.has('v')) {
+        return url.searchParams.get('v')?.substring(0, 11) || null;
+      }
+
+      const paths = url.pathname.split('/').filter(Boolean);
+      if (paths.length > 1 && ['live', 'shorts', 'embed'].includes(paths[0].toLowerCase())) {
+        return paths[1].substring(0, 11);
+      }
+
+      if (url.hostname === 'youtu.be' && paths.length > 0) {
+        return paths[0].substring(0, 11);
+      }
+    } catch {
       return null;
     }
+
+    return null;
   }
 
-  static debugLog(isDebug, ...args) {
-    if (isDebug) {
-      console.log('[YTDate Debug]', ...args);
-    }
-  }
-
-  static sanitizeVideoId(videoId) {
-    if (!videoId || typeof videoId !== 'string') return null;
-    // YouTube動画IDの形式をチェック（11文字の英数字、ハイフン、アンダースコア）
-    return /^[A-Za-z0-9_-]{11}$/.test(videoId) ? videoId : null;
+  static formatDate(isoString) {
+    if (!isoString) return null;
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return null;
+    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
   }
 }
 
 class YouTubeAPI {
   constructor() {
     this.apiKey = null;
-    this.isDebugMode = false;
-    this.requestCount = 0;
-    this.lastRequestTime = 0;
-    this.rateLimitDelay = 100; // 100ms間隔でリクエスト制限
-    this.initializeSettings();
   }
 
-  async initializeSettings() {
-    try {
-      const result = await chrome.storage.sync.get(['youtubeApiKey', 'debugMode']);
-      this.apiKey = result.youtubeApiKey || null;
-      this.isDebugMode = result.debugMode || false;
-      
-      Utils.debugLog(this.isDebugMode, 'API初期化完了', {
-        hasApiKey: !!this.apiKey,
-        debugMode: this.isDebugMode
-      });
-      
-      if (!this.apiKey) {
-        this.showAPIKeyRequiredMessage();
-      }
-    } catch (error) {
-      console.error('[YTDate] Settings initialization error:', error);
-    }
+  async init() {
+    const result = await chrome.storage.sync.get(['youtubeApiKey']);
+    this.apiKey = result.youtubeApiKey || null;
   }
 
-  showAPIKeyRequiredMessage() {
-    const messageDiv = document.createElement('div');
-    messageDiv.style.cssText = `
-      position: fixed;
-      top: 20px;
-      right: 20px;
-      background: #ff5722;
-      color: white;
-      padding: 15px 20px;
-      border-radius: 8px;
-      z-index: 10000;
-      font-family: Arial, sans-serif;
-      font-size: 14px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-      cursor: pointer;
-      max-width: 300px;
-    `;
-    messageDiv.innerHTML = `
-      <strong>YouTube Date Display</strong><br>
-      APIキーが設定されていません。<br>
-      <small>クリックして設定ページを開く</small>
-    `;
-    
-    messageDiv.addEventListener('click', () => {
-      chrome.runtime.sendMessage({ action: 'openOptions' });
-      messageDiv.remove();
-    });
-    
-    document.body.appendChild(messageDiv);
-    
-    // 10秒後に自動で削除
-    setTimeout(() => {
-      if (messageDiv.parentNode) {
-        messageDiv.remove();
-      }
-    }, 10000);
-  }
-
-  async fetchVideoDetails(videoId) {
-    if (!this.apiKey) {
-      Utils.debugLog(this.isDebugMode, 'APIキーが設定されていません');
-      return null;
-    }
-
-    const sanitizedVideoId = Utils.sanitizeVideoId(videoId);
-    if (!sanitizedVideoId) {
-      Utils.debugLog(this.isDebugMode, '無効な動画ID:', videoId);
-      return null;
-    }
+  async fetchPublishedDate(videoId) {
+    if (!videoId) return { ok: false, reason: 'not_found', publishedAt: null };
+    if (!this.apiKey) return { ok: false, reason: 'no_api', publishedAt: null };
 
     try {
-      // レート制限の実装
-      const now = Date.now();
-      const timeSinceLastRequest = now - this.lastRequestTime;
-      if (timeSinceLastRequest < this.rateLimitDelay) {
-        await new Promise(resolve => setTimeout(resolve, this.rateLimitDelay - timeSinceLastRequest));
-      }
-      
-      this.lastRequestTime = Date.now();
-      this.requestCount++;
-      
-      const url = `https://www.googleapis.com/youtube/v3/videos?id=${encodeURIComponent(sanitizedVideoId)}&part=snippet&key=${encodeURIComponent(this.apiKey)}`;
-      
-      Utils.debugLog(this.isDebugMode, `API呼び出し開始 (${this.requestCount}回目):`, sanitizedVideoId);
-      
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        if (response.status === 403) {
-          console.warn('[YTDate] API quota exceeded or invalid key');
-          this.showQuotaExceededMessage();
-          return null;
-        } else if (response.status === 429) {
-          console.warn('[YTDate] Rate limit exceeded');
-          return null;
-        }
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-      
-      const data = await response.json();
-      const item = data.items?.[0];
-      
-      if (item) {
-        const result = { 
-          publishedAt: item.snippet.publishedAt, 
-          title: item.snippet.title 
-        };
-        
-        Utils.debugLog(this.isDebugMode, 'API呼び出し成功:', {
-          videoId: sanitizedVideoId,
-          publishedAt: result.publishedAt,
-          title: result.title?.substring(0, 50) + '...'
-        });
-        
-        return result;
-      } else {
-        Utils.debugLog(this.isDebugMode, 'API応答に動画データがありません:', sanitizedVideoId);
-        return null;
-      }
-    } catch (error) {
-      console.error('[YTDate] Error fetching video details:', error);
-      Utils.debugLog(this.isDebugMode, 'API呼び出しエラー:', error);
-      return null;
+      const url =
+        `https://www.googleapis.com/youtube/v3/videos` +
+        `?id=${encodeURIComponent(videoId)}` +
+        `&part=snippet` +
+        `&key=${encodeURIComponent(this.apiKey)}`;
+
+      const res = await fetch(url);
+      if (!res.ok) return { ok: false, reason: 'network', publishedAt: null };
+
+      const data = await res.json();
+      const publishedAt = data.items?.[0]?.snippet?.publishedAt || null;
+      if (!publishedAt) return { ok: false, reason: 'not_found', publishedAt: null };
+
+      return { ok: true, reason: null, publishedAt };
+    } catch {
+      return { ok: false, reason: 'network', publishedAt: null };
     }
-  }
-
-  showQuotaExceededMessage() {
-    const messageDiv = document.createElement('div');
-    messageDiv.style.cssText = `
-      position: fixed;
-      top: 20px;
-      right: 20px;
-      background: #ff9800;
-      color: white;
-      padding: 15px 20px;
-      border-radius: 8px;
-      z-index: 10000;
-      font-family: Arial, sans-serif;
-      font-size: 14px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-      max-width: 300px;
-    `;
-    messageDiv.innerHTML = `
-      <strong>YouTube Date Display</strong><br>
-      APIの使用制限に達しました。<br>
-      <small>明日まで待つか、Google Cloud Consoleで制限を増やしてください。</small>
-    `;
-    
-    document.body.appendChild(messageDiv);
-    
-    setTimeout(() => {
-      if (messageDiv.parentNode) {
-        messageDiv.remove();
-      }
-    }, 8000);
-  }
-
-  // 外部からAPIキーをリセットする際に使用
-  static resetAPIKey() {
-    chrome.storage.sync.remove(['youtubeApiKey'], () => {
-      console.log('[YTDate] APIキーがリセットされました');
-    });
-  }
-}
-
-class DOMManager {
-  constructor() {
-    this.processedElements = new Set();
-    this.intersectionObserver = null;
-    this.mutationObserver = null;
-  }
-
-  setupIntersectionObserver(callback) {
-    if (this.intersectionObserver) this.intersectionObserver.disconnect();
-    this.intersectionObserver = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting) callback(entry.target);
-      });
-    }, { rootMargin: '50px', threshold: 0.1 });
-    this.observeContainers();
-  }
-
-  observeContainers() {
-    const containers = document.querySelectorAll(CONFIG.SELECTORS.CONTAINERS.join(', '));
-    containers.forEach(container => {
-      if (container) {
-        this.intersectionObserver.observe(container);
-      }
-    });
-  }
-
-  setupMutationObserver(callback) {
-    if (this.mutationObserver) this.mutationObserver.disconnect();
-    this.mutationObserver = new MutationObserver((mutations) => {
-      let shouldUpdate = false;
-      mutations.forEach(mutation => {
-        if (mutation.addedNodes.length > 0) {
-          mutation.addedNodes.forEach(node => {
-            if (node.nodeType === Node.ELEMENT_NODE && this.isRelevantElement(node)) {
-              shouldUpdate = true;
-            }
-          });
-        }
-      });
-      if (shouldUpdate) callback();
-    });
-    this.mutationObserver.observe(document.body, { 
-      childList: true, 
-      subtree: true, 
-      attributes: false 
-    });
-  }
-
-  isRelevantElement(element) {
-    return element.matches?.(CONFIG.SELECTORS.CONTAINERS.join(', ')) ||
-           element.querySelector?.(CONFIG.SELECTORS.VIDEO_TITLE) ||
-           element.matches?.(CONFIG.SELECTORS.VIDEO_TITLE);
-  }
-
-  getVideoIdFromElement(element) {
-    if (!element) return null;
-    
-    const videoElement = element.closest(CONFIG.SELECTORS.VIDEO_ELEMENTS.join(', '));
-    if (!videoElement) return null;
-    
-    const link = videoElement.querySelector(CONFIG.SELECTORS.VIDEO_LINK);
-    if (!link || !link.href) return null;
-    
-    return Utils.extractVideoId(link.href);
-  }
-
-  processNewElements(container, callback) {
-    if (!container) return;
-    
-    const titleElements = container.querySelectorAll(CONFIG.SELECTORS.VIDEO_TITLE);
-    titleElements.forEach(element => {
-      if (element && !this.processedElements.has(element)) {
-        this.processedElements.add(element);
-        callback(element);
-      }
-    });
-  }
-
-  cleanup() {
-    this.intersectionObserver?.disconnect();
-    this.mutationObserver?.disconnect();
-    this.processedElements.clear();
-  }
-}
-
-class HoverHandler {
-  constructor(element, api, debug = false) {
-    this.element = element;
-    this.api = api;
-    this.debug = debug;
-    this.apiCallTimer = null;
-    this.animationTimers = [];
-    this.overlay = null;
-    this.isDestroyed = false;
-  }
-
-  onMouseEnter() {
-    if (this.isDestroyed) return;
-    
-    Utils.debugLog(this.debug, '[ホバー調査 1/4] onMouseEnter: 実行開始');
-    
-    const container = this.getVideoContainer();
-    if (!container) {
-      Utils.debugLog(this.debug, '[ホバー調査] エラー: コンテナが見つからないため終了');
-      return;
-    }
-    
-    if (container.querySelector(CONFIG.SELECTORS.DATE_OVERLAY)) {
-      Utils.debugLog(this.debug, '[ホバー調査] 既に処理済みのため終了');
-      return;
-    }
-    
-    Utils.debugLog(this.debug, '[ホバー調査 2/4] 動画コンテナを発見:', container);
-    
-    const dateSpan = this.getRelativeDateSpan(container);
-    if (!dateSpan) {
-      Utils.debugLog(this.debug, '[ホバー調査] エラー: 相対日付のspan要素が見つかりませんでした。');
-      return;
-    }
-    
-    Utils.debugLog(this.debug, '[ホバー調査 3/4] 相対日付のspan要素を発見:', dateSpan);
-    
-    this.createOverlay(container, dateSpan);
-    this.startAnimation();
-    this.scheduleAPICall();
-    
-    Utils.debugLog(this.debug, '[ホバー調査 4/4] API呼び出しをスケジュールしました');
-  }
-
-  onMouseLeave() {
-    this.clearTimers();
-    if (this.overlay && !this.overlay.classList.contains('is-permanent')) {
-      this.overlay.remove();
-      this.overlay = null;
-    }
-  }
-
-  getVideoContainer() { 
-    return this.element?.closest(CONFIG.SELECTORS.VIDEO_ELEMENTS.join(', ')); 
-  }
-
-  getRelativeDateSpan(container) {
-    if (!container) return null;
-    
-    const spans = container.querySelectorAll(CONFIG.SELECTORS.METADATA_LINE);
-    Utils.debugLog(this.debug, '[ホバー調査] getRelativeDateSpan: メタデータ候補:', 
-      Array.from(spans).map(item => item.textContent?.trim()));
-    
-    const metadataItems = Array.from(spans).filter(span => 
-      span.textContent && span.textContent.trim() && span.textContent.trim() !== '•'
-    );
-    
-    return metadataItems.length > 0 ? metadataItems[metadataItems.length - 1] : null;
-  }
-
-  createOverlay(container, dateSpan) {
-    if (!container || !dateSpan) return;
-    
-    this.overlay = document.createElement('span');
-    this.overlay.className = 'absolute-date-overlay';
-    this.applyOverlayStyles(container);
-    
-    try {
-      dateSpan.insertAdjacentElement('afterend', this.overlay);
-    } catch (error) {
-      console.error('[YTDate] Error creating overlay:', error);
-      this.overlay = null;
-    }
-  }
-
-  applyOverlayStyles(container) {
-    if (!this.overlay || !container) return;
-    
-    const baseStyles = { 
-      fontFamily: '"Roboto", "Arial", sans-serif', 
-      fontSize: '1.4rem', 
-      fontWeight: '400', 
-      color: 'var(--yt-spec-text-secondary)',
-      opacity: '1'
-    };
-    
-    const isCompact = container.tagName.toLowerCase() === 'ytd-compact-video-renderer';
-    const layoutStyles = isCompact ? 
-      { display: 'block', marginLeft: '0' } : 
-      { display: 'inline', marginLeft: '4px' };
-    
-    Object.assign(this.overlay.style, { ...baseStyles, ...layoutStyles });
-  }
-
-  startAnimation() {
-    if (!this.overlay || this.isDestroyed) return;
-    
-    this.overlay.textContent = ' !';
-    
-    CONFIG.ANIMATION_STEPS.forEach((delay, index) => {
-      const timer = setTimeout(() => {
-        if (this.overlay && !this.isDestroyed) {
-          this.overlay.textContent = ' ' + '!'.repeat(index + 2);
-        }
-      }, delay);
-      this.animationTimers.push(timer);
-    });
-  }
-
-  scheduleAPICall() {
-    if (this.isDestroyed) return;
-    
-    this.apiCallTimer = setTimeout(async () => {
-      if (!this.isDestroyed) {
-        await this.executeAPICall();
-      }
-    }, CONFIG.TIMING.HOVER_DELAY_MS);
-  }
-
-  async executeAPICall() {
-    if (this.isDestroyed || !this.overlay) return;
-    
-    const videoId = DOMManager.prototype.getVideoIdFromElement.call(this, this.element);
-    if (!videoId) {
-      this.overlay?.remove();
-      return;
-    }
-    
-    if (this.overlay) {
-      this.overlay.textContent = ' (読み込み中...)';
-    }
-    
-    try {
-      const videoDetails = await this.api.fetchVideoDetails(videoId);
-      if (!this.isDestroyed) {
-        this.updateOverlayWithResult(videoDetails);
-      }
-    } catch (error) {
-      console.error('[YTDate] API call error:', error);
-      if (this.overlay && !this.isDestroyed) {
-        this.overlay.remove();
-      }
-    }
-  }
-
-  updateOverlayWithResult(videoDetails) {
-    if (!this.overlay || this.isDestroyed) return;
-    
-    if (videoDetails && videoDetails.publishedAt) {
-      const formattedDate = Utils.formatDate(videoDetails.publishedAt);
-      if (formattedDate) {
-        const container = this.getVideoContainer();
-        const isCompact = container?.tagName.toLowerCase() === 'ytd-compact-video-renderer';
-        
-        this.overlay.textContent = isCompact ? `(${formattedDate})` : `• ${formattedDate}`;
-        this.overlay.title = `実際のアップロード日: ${formattedDate}`;
-        this.overlay.classList.add('is-permanent');
-      } else {
-        this.overlay.remove();
-      }
-    } else {
-      this.overlay.remove();
-    }
-  }
-
-  clearTimers() {
-    if (this.apiCallTimer) {
-      clearTimeout(this.apiCallTimer);
-      this.apiCallTimer = null;
-    }
-    
-    this.animationTimers.forEach(timer => clearTimeout(timer));
-    this.animationTimers = [];
-  }
-
-  destroy() {
-    this.isDestroyed = true;
-    this.clearTimers();
-    if (this.overlay) {
-      this.overlay.remove();
-      this.overlay = null;
-    }
-  }
-}
-
-class URLObserver {
-  constructor() {
-    this.currentUrl = location.href;
-    this.observer = null;
-    this.setupObserver();
-  }
-
-  setupObserver() {
-    this.observer = new MutationObserver(() => {
-      if (location.href !== this.currentUrl) {
-        this.currentUrl = location.href;
-        setTimeout(() => ExtensionManager.reinitialize(), CONFIG.TIMING.URL_CHANGE_DELAY_MS);
-      }
-    });
-    
-    this.observer.observe(document, { subtree: true, childList: true });
-  }
-
-  cleanup() {
-    this.observer?.disconnect();
   }
 }
 
 class YouTubeDateDisplay {
   constructor() {
     this.api = new YouTubeAPI();
-    this.domManager = new DOMManager();
-    this.hoverHandlers = new Map();
-    this.isInitialized = false;
+
+    // videoId -> { status:'ok', date } | { status:'fail', ts, reason }
+    this.cache = new Map();
+
+    // videoId -> Promise<{ok:boolean, date:string|null, reason:string|null}>
+    this.promiseMap = new Map();
+
+    // card -> anchor span
+    this.anchorMap = new WeakMap();
+
+    this.currentCard = null;
+    this.currentVideoId = null;
+
+    this.hoverTimer = null;
+    this.animationTimer = null;
+    this.hoverToken = 0;
+
     this.initialize();
   }
 
   async initialize() {
-    try {
-      await this.api.initializeSettings();
-      
-      if (!this.api.apiKey) {
-        console.warn('[YTDate] APIキーが設定されていません');
-        return;
-      }
-      
-      this.setupEventListeners();
-      this.processExistingElements();
-      this.isInitialized = true;
-      
-      console.log('[YTDate] Extension initialized successfully');
-    } catch (error) {
-      console.error('[YTDate] Initialization error:', error);
-    }
+    await this.api.init();
+    this.setupEventListeners();
   }
 
   setupEventListeners() {
-    this.domManager.setupIntersectionObserver((container) => {
-      this.domManager.processNewElements(container, (element) => {
-        this.attachHoverHandler(element);
-      });
-    });
-    
-    this.domManager.setupMutationObserver(() => {
-      this.processExistingElements();
-    });
-  }
+    document.addEventListener('mouseover', (e) => this.handleMouseOver(e), true);
+    document.addEventListener('mouseout', (e) => this.handleMouseOut(e), true);
+    document.addEventListener('yt-navigate-finish', () => this.clearState());
 
-  processExistingElements() {
-    const containers = document.querySelectorAll(CONFIG.SELECTORS.CONTAINERS.join(', '));
-    containers.forEach(container => {
-      this.domManager.processNewElements(container, (element) => {
-        this.attachHoverHandler(element);
-      });
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === 'sync' && changes.youtubeApiKey !== undefined) {
+        this.api.apiKey = changes.youtubeApiKey.newValue;
+      }
     });
   }
 
-  attachHoverHandler(element) {
-    if (!element || this.hoverHandlers.has(element)) return;
-    
-    const handler = new HoverHandler(element, this.api, this.api.isDebugMode);
-    this.hoverHandlers.set(element, handler);
-    
-    element.addEventListener('mouseenter', () => handler.onMouseEnter());
-    element.addEventListener('mouseleave', () => handler.onMouseLeave());
-  }
+  handleMouseOver(e) {
+    const card = e.target.closest(CONFIG.VIDEO_CARDS);
+    if (!card) return;
 
-  cleanup() {
-    this.hoverHandlers.forEach(handler => handler.destroy());
-    this.hoverHandlers.clear();
-    this.domManager.cleanup();
-    this.isInitialized = false;
-  }
-}
+    const videoId = Utils.extractVideoId(card);
+    if (!videoId) return;
 
-class ExtensionManager {
-  static instance = null;
-  static urlObserver = null;
+    // 同一カード・同一動画なら何もしない
+    if (card === this.currentCard && this.currentVideoId === videoId) return;
 
-  static initialize() {
-    if (this.instance) {
-      this.instance.cleanup();
+    this.currentCard = card;
+    this.currentVideoId = videoId;
+
+    // アンカー確定（無ければ以降処理しない）
+    const anchor = this.getAnchor(card);
+    if (!anchor) return;
+
+    const cacheEntry = this.cache.get(videoId);
+
+    if (cacheEntry?.status === 'ok') {
+      this.injectDateOverlay(card, cacheEntry.date);
+      return;
     }
-    
-    this.instance = new YouTubeDateDisplay();
-    
-    if (!this.urlObserver) {
-      this.urlObserver = new URLObserver();
+
+    if (cacheEntry?.status === 'fail') {
+      const freshFail = Date.now() - cacheEntry.ts < CONFIG.TIMING.NEGATIVE_CACHE_TTL_MS;
+      if (freshFail) {
+        // no_api時はうるさくしない（必要なら表示に変えてOK）
+        if (cacheEntry.reason !== 'no_api') this.injectErrorOverlay(card);
+        return;
+      }
+      this.cache.delete(videoId);
+    }
+
+    this.startProgressiveLoader(card, videoId);
+  }
+
+  handleMouseOut(e) {
+    if (!this.currentCard) return;
+    if (this.currentCard.contains(e.relatedTarget)) return;
+    this.clearState();
+  }
+
+  startProgressiveLoader(card, videoId) {
+    this.clearAnimationOnly();
+
+    // 位置固定のため anchor 必須
+    const anchor = this.getAnchor(card);
+    if (!anchor) return;
+
+    let step = 0;
+    const steps = ['I..', 'II.', 'III'];
+
+    this.startHoverTimer(card, videoId);
+
+    const runAnimation = () => {
+      if (this.currentCard !== card || this.currentVideoId !== videoId) return;
+      if (step < steps.length) {
+        const txt = card.querySelector('.absolute-date-overlay')?.textContent || '';
+        if (txt.includes('/')) return; // 確定済みなら停止
+        this.injectDateOverlay(card, steps[step]);
+        step++;
+        this.animationTimer = setTimeout(runAnimation, CONFIG.TIMING.STEP_INTERVAL_MS);
+      }
+    };
+
+    runAnimation();
+  }
+
+  startHoverTimer(card, videoId) {
+    clearTimeout(this.hoverTimer);
+    const token = ++this.hoverToken;
+
+    this.hoverTimer = setTimeout(async () => {
+      if (token !== this.hoverToken) return;
+      if (this.currentCard !== card || this.currentVideoId !== videoId) return;
+      await this.processCard(card, videoId);
+    }, CONFIG.TIMING.API_DELAY_MS);
+  }
+
+  async processCard(card, videoId) {
+    if (this.currentCard !== card || this.currentVideoId !== videoId) return;
+
+    // anchor必須（相対日付の横固定）
+    const anchor = this.getAnchor(card);
+    if (!anchor) return;
+
+    const result = await this.fetchDateWithDedup(videoId);
+
+    // 待っている間に対象が変わっていたら描画しない
+    if (this.currentCard !== card || this.currentVideoId !== videoId) return;
+
+    if (result.ok && result.date) {
+      this.cache.set(videoId, { status: 'ok', date: result.date });
+      this.injectDateOverlay(card, result.date);
+      return;
+    }
+
+    // fail cache（reason付き）
+    this.cache.set(videoId, {
+      status: 'fail',
+      ts: Date.now(),
+      reason: result.reason || 'network'
+    });
+
+    // no_apiは無表示、その他は軽く×表示
+    if (result.reason !== 'no_api') {
+      this.injectErrorOverlay(card);
+    } else {
+      this.removeLoader(card);
     }
   }
 
-  static reinitialize() { 
-    this.initialize(); 
-  }
-
-  static resetAPIKey() { 
-    return YouTubeAPI.resetAPIKey(); 
-  }
-
-  static cleanup() {
-    this.instance?.cleanup();
-    this.urlObserver?.cleanup();
-    this.instance = null;
-    this.urlObserver = null;
-  }
-}
-
-// メッセージリスナーの追加
-if (typeof chrome !== 'undefined' && chrome.runtime) {
-  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === 'openOptions') {
-      chrome.runtime.openOptionsPage();
+  async fetchDateWithDedup(videoId) {
+    if (this.promiseMap.has(videoId)) {
+      return this.promiseMap.get(videoId);
     }
-  });
-}
 
-// 拡張機能の初期化
-function initializeExtension() {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', ExtensionManager.initialize.bind(ExtensionManager));
-  } else {
-    ExtensionManager.initialize();
+    const p = (async () => {
+      const apiResult = await this.api.fetchPublishedDate(videoId);
+
+      if (!apiResult.ok) {
+        return { ok: false, date: null, reason: apiResult.reason || 'network' };
+      }
+
+      const date = Utils.formatDate(apiResult.publishedAt);
+      if (!date) return { ok: false, date: null, reason: 'not_found' };
+
+      return { ok: true, date, reason: null };
+    })().finally(() => {
+      this.promiseMap.delete(videoId);
+    });
+
+    this.promiseMap.set(videoId, p);
+    return p;
+  }
+
+  findRelativeDateSpan(card) {
+    const containers = Array.from(card.querySelectorAll(CONFIG.METADATA_SELECTOR));
+    const roots = containers.length ? containers : [card];
+
+    for (const root of roots) {
+      const spans = Array.from(root.querySelectorAll('span'));
+      for (const s of spans) {
+        const text = (s.textContent || '').trim();
+        if (!text || text.length > 40) continue;
+
+        const aria = (s.getAttribute('aria-label') || '').trim();
+        const title = (s.getAttribute('title') || '').trim();
+        const probe = `${text} ${aria} ${title}`;
+
+        if (CONFIG.RELATIVE_DATE_PATTERN.test(probe)) return s;
+      }
+    }
+    return null;
+  }
+
+  getAnchor(card) {
+    const cached = this.anchorMap.get(card);
+    if (cached && cached.isConnected && card.contains(cached)) return cached;
+
+    const span = this.findRelativeDateSpan(card);
+    if (span) this.anchorMap.set(card, span);
+    return span || null;
+  }
+
+  injectDateOverlay(card, text) {
+    const isDate = text.includes('/');
+
+    const anchor = this.getAnchor(card);
+    if (!anchor || !anchor.isConnected || !card.contains(anchor)) return;
+
+    const existingOverlay = card.querySelector('.absolute-date-overlay');
+
+    // 確定日付があるときローダーで上書きしない
+    if (existingOverlay && existingOverlay.dataset.isFinal === 'true' && !isDate) return;
+
+    if (existingOverlay) existingOverlay.remove();
+
+    const overlay = document.createElement('span');
+    overlay.className = 'absolute-date-overlay ytContentMetadataViewModelMetadataText';
+    if (isDate) overlay.dataset.isFinal = 'true';
+
+    overlay.style.cssText = `
+      color: var(--yt-spec-text-secondary);
+      font-weight: 500;
+      margin-left: 6px;
+      padding: 1px 6px;
+      background-color: var(--yt-spec-badge-chip-background, rgba(0, 0, 0, 0.05));
+      border-radius: 4px;
+      font-size: 1.4rem;
+      line-height: 1.8rem;
+      display: inline-flex;
+      align-items: center;
+      vertical-align: text-bottom;
+      min-width: 2.2em;
+      justify-content: center;
+    `;
+
+    overlay.textContent = isDate ? `(${text})` : text;
+
+    // 相対日付の直後に固定挿入
+    anchor.insertAdjacentElement('afterend', overlay);
+  }
+
+  injectErrorOverlay(card) {
+    const anchor = this.getAnchor(card);
+    if (!anchor || !anchor.isConnected || !card.contains(anchor)) return;
+
+    const existingOverlay = card.querySelector('.absolute-date-overlay');
+    if (existingOverlay && existingOverlay.dataset.isFinal === 'true') return;
+    if (existingOverlay) existingOverlay.remove();
+
+    const overlay = document.createElement('span');
+    overlay.className = 'absolute-date-overlay';
+    overlay.dataset.isError = 'true';
+    overlay.style.cssText = `
+      color: var(--yt-spec-error, #f44336);
+      font-weight: 700;
+      margin-left: 6px;
+      padding: 1px 6px;
+      background-color: rgba(244, 67, 54, 0.12);
+      border-radius: 4px;
+      font-size: 1.2rem;
+      line-height: 1.8rem;
+      display: inline-flex;
+      align-items: center;
+      vertical-align: text-bottom;
+      min-width: 1.8em;
+      justify-content: center;
+    `;
+    overlay.textContent = '×';
+
+    // 相対日付の直後に固定挿入
+    anchor.insertAdjacentElement('afterend', overlay);
+
+    setTimeout(() => {
+      if (overlay.isConnected && overlay.dataset.isError === 'true') overlay.remove();
+    }, CONFIG.TIMING.ERROR_BADGE_TTL_MS);
+  }
+
+  removeLoader(card) {
+    const overlay = card.querySelector('.absolute-date-overlay');
+    if (overlay && !overlay.dataset.isFinal) overlay.remove();
+  }
+
+  clearAnimationOnly() {
+    if (this.animationTimer) clearTimeout(this.animationTimer);
+  }
+
+  clearState() {
+    this.clearAnimationOnly();
+    if (this.hoverTimer) clearTimeout(this.hoverTimer);
+    if (this.currentCard) this.removeLoader(this.currentCard);
+
+    this.currentCard = null;
+    this.currentVideoId = null;
+    this.hoverToken++;
   }
 }
 
-// ページがYouTubeかどうかを確認
 if (window.location.hostname === 'www.youtube.com') {
-  initializeExtension();
+  new YouTubeDateDisplay();
 }
-
-// ページのアンロード時にクリーンアップ
-window.addEventListener('beforeunload', () => {
-  ExtensionManager.cleanup();
-});
-
-/* Copyright 2025 tumin-dosu. All rights reserved. */
